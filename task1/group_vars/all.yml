@@ -1,0 +1,19 @@
+---
+# SSH / sudo
+ansible_user:        ubuntu
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+ansible_become_pass: "{{ ubuntu_pass }}"   # ubuntu sudo password (from vault)
+
+# Cluster internal IPs
+jn:          "192.168.10.58"
+nn:          "192.168.10.9"
+dn_00:       "192.168.10.8"
+dn_01:       "192.168.10.10"
+jn_external: "178.236.25.98"
+
+# Hadoop
+hadoop_version:      "3.3.6"
+hadoop_download_url: "https://downloads.apache.org/hadoop/common/hadoop-{{ hadoop_version }}/hadoop-{{ hadoop_version }}.tar.gz"
+hadoop_user:         "hadoop"
+hadoop_user_home:    "/home/{{ hadoop_user }}"
+hadoop_home:         "/home/{{ hadoop_user }}/hadoop"

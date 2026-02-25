@@ -1,0 +1,319 @@
+---
+- name: Create hadoop user on all nodes
+  hosts: all_nodes
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [users]
+  tasks:
+    - name: Ensure hadoop group exists
+      ansible.builtin.group:
+        name: "{{ hadoop_user }}"
+        state: present
+
+    - name: Create hadoop user with password
+      ansible.builtin.user:
+        name: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        shell: /bin/bash
+        home: "{{ hadoop_user_home }}"
+        create_home: yes
+        password: "{{ hadoop_pass | password_hash('sha512') }}"
+        state: present
+
+    - name: Create .ssh directory for hadoop user
+      ansible.builtin.file:
+        path: "{{ hadoop_user_home }}/.ssh"
+        state: directory
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0700'
+
+
+- name: Generate and read hadoop SSH keypair on JN
+  hosts: jn
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [ssh_keygen, ssh_keys]
+  tasks:
+    - name: Generate ed25519 keypair (idempotent)
+      ansible.builtin.command:
+        cmd: "ssh-keygen -t ed25519 -f {{ hadoop_user_home }}/.ssh/id_ed25519 -N '' -C '{{ hadoop_user }}@jn'"
+        creates: "{{ hadoop_user_home }}/.ssh/id_ed25519"
+      become_user: "{{ hadoop_user }}"
+
+    - name: Fix permissions — private key
+      ansible.builtin.file:
+        path: "{{ hadoop_user_home }}/.ssh/id_ed25519"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0600'
+
+    - name: Fix permissions — public key
+      ansible.builtin.file:
+        path: "{{ hadoop_user_home }}/.ssh/id_ed25519.pub"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+    - name: Slurp public key
+      ansible.builtin.slurp:
+        src: "{{ hadoop_user_home }}/.ssh/id_ed25519.pub"
+      register: _pubkey
+
+    - name: Slurp private key
+      ansible.builtin.slurp:
+        src: "{{ hadoop_user_home }}/.ssh/id_ed25519"
+      register: _privkey
+
+    - name: Store keys as host facts
+      ansible.builtin.set_fact:
+        hadoop_pub_key:  "{{ _pubkey['content']  | b64decode | trim }}"
+        hadoop_priv_key: "{{ _privkey['content'] | b64decode }}"
+
+
+- name: Distribute hadoop SSH keys to all nodes
+  hosts: all_nodes
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [ssh_distribute, ssh_keys]
+  tasks:
+    - name: Authorise hadoop public key
+      ansible.builtin.authorized_key:
+        user: "{{ hadoop_user }}"
+        key: "{{ hostvars['jn']['hadoop_pub_key'] }}"
+        state: present
+
+    - name: Deploy private key
+      ansible.builtin.copy:
+        content: "{{ hostvars['jn']['hadoop_priv_key'] }}"
+        dest: "{{ hadoop_user_home }}/.ssh/id_ed25519"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0600'
+
+    - name: Deploy public key
+      ansible.builtin.copy:
+        content: "{{ hostvars['jn']['hadoop_pub_key'] }}\n"
+        dest: "{{ hadoop_user_home }}/.ssh/id_ed25519.pub"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+    - name: Build known_hosts for all cluster nodes
+      ansible.builtin.shell: |
+        ssh-keyscan -H {{ jn }} {{ nn }} {{ dn_00 }} {{ dn_01 }} 2>/dev/null \
+          > {{ hadoop_user_home }}/.ssh/known_hosts
+        chmod 600 {{ hadoop_user_home }}/.ssh/known_hosts
+        chown {{ hadoop_user }}:{{ hadoop_user }} {{ hadoop_user_home }}/.ssh/known_hosts
+      args:
+        creates: "{{ hadoop_user_home }}/.ssh/known_hosts"
+
+
+- name: Fix hadoop home ownership on internal nodes
+  hosts: internal
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [fix_perms]
+  tasks:
+    - name: "chown -R {{ hadoop_user }}:{{ hadoop_user }} {{ hadoop_user_home }}"
+      ansible.builtin.file:
+        path: "{{ hadoop_user_home }}"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        recurse: yes
+        state: directory
+
+
+- name: Install Hadoop on JN and distribute to internal nodes
+  hosts: jn
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [install]
+  tasks:
+    - name: Download Hadoop tarball on JN
+      ansible.builtin.shell:
+        cmd: "wget -q -O {{ hadoop_user_home }}/hadoop-{{ hadoop_version }}.tar.gz {{ hadoop_download_url }}"
+        creates: "{{ hadoop_user_home }}/hadoop-{{ hadoop_version }}.tar.gz"
+
+    - name: Extract Hadoop on JN
+      ansible.builtin.shell:
+        cmd: >
+          tar -xzf {{ hadoop_user_home }}/hadoop-{{ hadoop_version }}.tar.gz
+          -C {{ hadoop_user_home }}
+          && mv {{ hadoop_user_home }}/hadoop-{{ hadoop_version }} {{ hadoop_home }}
+        creates: "{{ hadoop_home }}"
+
+    - name: SCP tarball and extract on each internal node
+      ansible.builtin.shell: |
+        set -e
+        if ! ssh -o StrictHostKeyChecking=no {{ hadoop_user }}@{{ item }} \
+             "test -f {{ hadoop_home }}/etc/hadoop/hadoop-env.sh"; then
+          scp -o StrictHostKeyChecking=no \
+            {{ hadoop_user_home }}/hadoop-{{ hadoop_version }}.tar.gz \
+            {{ hadoop_user }}@{{ item }}:{{ hadoop_user_home }}/
+          ssh -o StrictHostKeyChecking=no {{ hadoop_user }}@{{ item }} \
+            "rm -rf {{ hadoop_home }} && \
+             tar -xzf {{ hadoop_user_home }}/hadoop-{{ hadoop_version }}.tar.gz \
+             -C {{ hadoop_user_home }} \
+             && mv {{ hadoop_user_home }}/hadoop-{{ hadoop_version }} {{ hadoop_home }}"
+        fi
+      loop:
+        - "{{ nn }}"
+        - "{{ dn_00 }}"
+        - "{{ dn_01 }}"
+      loop_control:
+        label: "{{ item }}"
+
+
+- name: Fix hadoop home ownership on internal nodes after install
+  hosts: internal
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [install, fix_perms]
+  tasks:
+    - name: "chown -R {{ hadoop_user }}:{{ hadoop_user }} {{ hadoop_user_home }}"
+      ansible.builtin.file:
+        path: "{{ hadoop_user_home }}"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        recurse: yes
+        state: directory
+
+
+- name: Configure Hadoop environment variables on all nodes
+  hosts: all_nodes
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [env]
+  tasks:
+    - name: Detect JAVA_HOME
+      ansible.builtin.shell: readlink -f $(which java) | sed 's|/bin/java||'
+      register: _java_home
+      changed_when: false
+
+    - name: Add Hadoop env block to .bash_profile
+      ansible.builtin.blockinfile:
+        path: "{{ hadoop_user_home }}/.bash_profile"
+        create: yes
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+        marker: "# {mark} HADOOP ENV"
+        block: |
+          export JAVA_HOME={{ _java_home.stdout }}
+          export HADOOP_HOME={{ hadoop_home }}
+          export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$JAVA_HOME/bin
+
+    - name: Set JAVA_HOME in hadoop-env.sh
+      ansible.builtin.lineinfile:
+        path: "{{ hadoop_home }}/etc/hadoop/hadoop-env.sh"
+        regexp: '^(#\s*)?export JAVA_HOME='
+        line: "export JAVA_HOME={{ _java_home.stdout }}"
+        create: yes
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+
+- name: Deploy Hadoop configuration on all nodes
+  hosts: all_nodes
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [config]
+  tasks:
+    - name: Deploy core-site.xml
+      ansible.builtin.template:
+        src: templates/core-site.xml.j2
+        dest: "{{ hadoop_home }}/etc/hadoop/core-site.xml"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+    - name: Deploy hdfs-site.xml
+      ansible.builtin.template:
+        src: templates/hdfs-site.xml.j2
+        dest: "{{ hadoop_home }}/etc/hadoop/hdfs-site.xml"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+    - name: Deploy workers file
+      ansible.builtin.template:
+        src: templates/workers.j2
+        dest: "{{ hadoop_home }}/etc/hadoop/workers"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+
+- name: Update /etc/hosts with cluster node entries
+  hosts: all_nodes
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [hosts]
+  tasks:
+    - name: Add cluster hostnames to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} HADOOP CLUSTER NODES"
+        block: |
+          {{ jn }} jn
+          {{ nn }} nn
+          {{ dn_00 }} dn-00
+          {{ dn_01 }} dn-01
+
+
+- name: Format NameNode and start HDFS
+  hosts: nn
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [hdfs_start]
+  tasks:
+    - name: Check if NameNode has been formatted
+      ansible.builtin.stat:
+        path: "/tmp/hadoop-{{ hadoop_user }}/dfs/name/current"
+      register: _nn_current
+
+    - name: Format NameNode (skipped if already formatted)
+      ansible.builtin.shell: "{{ hadoop_home }}/bin/hdfs namenode -format -nonInteractive"
+      when: not _nn_current.stat.exists
+      register: _format
+      changed_when: "'Storage directory' in _format.stdout"
+
+    - name: Start HDFS (start-dfs.sh runs from NameNode)
+      ansible.builtin.shell: "{{ hadoop_home }}/sbin/start-dfs.sh"
+      register: _start_dfs
+      changed_when: true
+
+    - name: Verify running Java processes on all nodes
+      ansible.builtin.shell: jps
+      register: _jps
+      changed_when: false
+      delegate_to: "{{ item }}"
+      loop:
+        - nn
+        - dn-00
+        - dn-01
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Show JPS output per node
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ item.stdout_lines }}"
+      loop: "{{ _jps.results }}"
+      loop_control:
+        label: "{{ item.item }}"
