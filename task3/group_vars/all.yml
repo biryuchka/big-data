@@ -1,0 +1,33 @@
+---
+# SSH / sudo
+ansible_user:        ubuntu
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+ansible_become_pass: "{{ ubuntu_pass }}"
+
+# Cluster internal IPs
+jn:          "192.168.10.58"
+nn:          "192.168.10.9"
+dn_00:       "192.168.10.8"
+dn_01:       "192.168.10.10"
+jn_external: "178.236.25.98"
+
+# Hadoop
+hadoop_version:      "3.4.3"
+hadoop_user:         "hadoop"
+hadoop_user_home:    "/home/{{ hadoop_user }}"
+hadoop_home:         "/home/{{ hadoop_user }}/hadoop"
+
+# Hive
+hive_version:        "4.0.0-alpha-2"
+hive_archive:        "apache-hive-{{ hive_version }}-bin.tar.gz"
+hive_download_url:   "https://archive.apache.org/dist/hive/hive-{{ hive_version }}/{{ hive_archive }}"
+hive_home:           "{{ hadoop_user_home }}/hive"
+
+# PostgreSQL JDBC driver
+pg_jdbc_version:     "42.7.3"
+pg_jdbc_jar:         "postgresql-{{ pg_jdbc_version }}.jar"
+pg_jdbc_url:         "https://jdbc.postgresql.org/download/{{ pg_jdbc_jar }}"
+
+# Hive Metastore DB
+hive_metastore_db_name: "hive_metastore"
+hive_metastore_db_user: "hive"

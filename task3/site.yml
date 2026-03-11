@@ -1,0 +1,311 @@
+# =============================================================================
+# Play 1 — Install and configure PostgreSQL for Hive Metastore
+# =============================================================================
+- name: Install and configure PostgreSQL for Hive Metastore
+  hosts: nn
+  become: yes
+  vars_files:
+    - vars/secrets.yml
+  tags: [postgresql]
+  tasks:
+    - name: Install PostgreSQL and dependencies
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - python3-psycopg2
+          - libpq-dev
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL is running
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Create hive database user
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: "{{ hive_metastore_db_user }}"
+        password: "{{ hive_metastore_db_pass }}"
+        state: present
+
+    - name: Create hive_metastore database
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: "{{ hive_metastore_db_name }}"
+        owner: "{{ hive_metastore_db_user }}"
+        state: present
+
+
+# =============================================================================
+# Play 2 — Download Hive + JDBC driver on JN, distribute to NN
+# =============================================================================
+- name: Download Hive and JDBC driver on JN, copy to NN
+  hosts: jn
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [install]
+  tasks:
+    - name: Download Hive tarball
+      ansible.builtin.get_url:
+        url: "{{ hive_download_url }}"
+        dest: "{{ hadoop_user_home }}/{{ hive_archive }}"
+        mode: '0644'
+
+    - name: Download PostgreSQL JDBC driver
+      ansible.builtin.get_url:
+        url: "{{ pg_jdbc_url }}"
+        dest: "{{ hadoop_user_home }}/{{ pg_jdbc_jar }}"
+        mode: '0644'
+
+    - name: Copy artifacts to NN
+      ansible.builtin.shell: |
+        ssh -o StrictHostKeyChecking=no \
+            -i {{ hadoop_user_home }}/.ssh/id_ed25519 \
+            {{ hadoop_user }}@{{ nn }} \
+            "test -f {{ hadoop_user_home }}/{{ item }}" \
+        || scp -o StrictHostKeyChecking=no \
+              -i {{ hadoop_user_home }}/.ssh/id_ed25519 \
+              {{ hadoop_user_home }}/{{ item }} \
+              {{ hadoop_user }}@{{ nn }}:{{ hadoop_user_home }}/
+      args:
+        executable: /bin/bash
+      loop:
+        - "{{ hive_archive }}"
+        - "{{ pg_jdbc_jar }}"
+
+
+# =============================================================================
+# Play 3 — Install and configure Hive on NN
+# =============================================================================
+- name: Install and configure Hive on NN
+  hosts: nn
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [install, env, config]
+  tasks:
+    - name: Extract Hive tarball
+      ansible.builtin.shell:
+        cmd: >
+          tar -xzf {{ hadoop_user_home }}/{{ hive_archive }}
+          -C {{ hadoop_user_home }}
+          && mv {{ hadoop_user_home }}/apache-hive-{{ hive_version }}-bin {{ hive_home }}
+        creates: "{{ hive_home }}"
+
+    - name: Copy PostgreSQL JDBC driver to Hive lib
+      ansible.builtin.copy:
+        src: "{{ hadoop_user_home }}/{{ pg_jdbc_jar }}"
+        dest: "{{ hive_home }}/lib/{{ pg_jdbc_jar }}"
+        remote_src: yes
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+    - name: Add Hive env block to .bash_profile
+      ansible.builtin.blockinfile:
+        path: "{{ hadoop_user_home }}/.bash_profile"
+        create: yes
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+        marker: "# {mark} HIVE ENV"
+        block: |
+          export HIVE_HOME={{ hive_home }}
+          export PATH=$PATH:$HIVE_HOME/bin
+
+    - name: Deploy hive-site.xml
+      ansible.builtin.template:
+        src: templates/hive-site.xml.j2
+        dest: "{{ hive_home }}/conf/hive-site.xml"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+
+# =============================================================================
+# Play 4 — Deploy YARN configuration on all cluster nodes
+# =============================================================================
+- name: Deploy YARN configuration on all nodes
+  hosts: all_nodes
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [yarn, config]
+  tasks:
+    - name: Deploy YARN/MapReduce configs
+      ansible.builtin.template:
+        src: "templates/{{ item.src }}"
+        dest: "{{ hadoop_home }}/etc/hadoop/{{ item.dest }}"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+      loop:
+        - { src: mapred-site.xml.j2, dest: mapred-site.xml }
+        - { src: yarn-site.xml.j2,   dest: yarn-site.xml }
+
+
+# =============================================================================
+# Play 5 — Start YARN, prepare HDFS, init and start Hive services
+# =============================================================================
+- name: Start YARN and Hive services on NN
+  hosts: nn
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [yarn, hdfs_dirs, metastore_init, metastore_start, hs2_start]
+  tasks:
+    # ---- YARN ----
+    - name: Check if ResourceManager is already running
+      ansible.builtin.shell: jps | grep -q ResourceManager
+      register: _rm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Start YARN (ResourceManager + NodeManagers)
+      ansible.builtin.shell: "{{ hadoop_home }}/sbin/start-yarn.sh"
+      when: _rm_check.rc != 0
+
+    - name: Show YARN processes
+      ansible.builtin.shell: jps
+      register: _jps
+      changed_when: false
+
+    - name: Print YARN processes
+      ansible.builtin.debug:
+        var: _jps.stdout_lines
+
+    # ---- HDFS directories ----
+    - name: Create HDFS directories for Hive
+      ansible.builtin.shell: |
+        source {{ hadoop_user_home }}/.bash_profile
+        hdfs dfs -mkdir -p {{ item.path }}
+        hdfs dfs -chmod {{ item.mode }} {{ item.path }}
+      args:
+        executable: /bin/bash
+      loop:
+        - { path: /tmp,                 mode: '777' }
+        - { path: /user/hive/warehouse, mode: 'g+w' }
+      changed_when: false
+
+    # ---- Metastore schema ----
+    - name: Check if Metastore schema is initialized
+      ansible.builtin.shell: |
+        source {{ hadoop_user_home }}/.bash_profile
+        schematool -dbType postgres -info
+      args:
+        executable: /bin/bash
+      register: _schema_check
+      failed_when: false
+      changed_when: false
+
+    - name: Initialize Metastore schema
+      ansible.builtin.shell: |
+        source {{ hadoop_user_home }}/.bash_profile
+        schematool -dbType postgres -initSchema
+      args:
+        executable: /bin/bash
+      when: _schema_check.rc != 0
+
+    # ---- Metastore service ----
+    - name: Check if Metastore is already running
+      ansible.builtin.shell: jps | grep -q HiveMetaStore
+      register: _ms_check
+      failed_when: false
+      changed_when: false
+
+    - name: Start Metastore in background
+      ansible.builtin.shell: |
+        source {{ hadoop_user_home }}/.bash_profile
+        nohup hive --service metastore >> {{ hadoop_user_home }}/metastore.log 2>&1 &
+        disown
+      args:
+        executable: /bin/bash
+      when: _ms_check.rc != 0
+
+    - name: Wait for Metastore to start (port 9083)
+      ansible.builtin.wait_for:
+        port: 9083
+        timeout: 60
+      when: _ms_check.rc != 0
+
+    # ---- HiveServer2 ----
+    - name: Check if HiveServer2 is already running
+      ansible.builtin.shell: jps | grep -q HiveServer2
+      register: _hs2_check
+      failed_when: false
+      changed_when: false
+
+    - name: Start HiveServer2 in background
+      ansible.builtin.shell: |
+        source {{ hadoop_user_home }}/.bash_profile
+        nohup hiveserver2 >> {{ hadoop_user_home }}/hiveserver2.log 2>&1 &
+        disown
+      args:
+        executable: /bin/bash
+      when: _hs2_check.rc != 0
+
+    - name: Wait for HiveServer2 to start (port 10000)
+      ansible.builtin.wait_for:
+        port: 10000
+        timeout: 120
+      when: _hs2_check.rc != 0
+
+
+# =============================================================================
+# Play 6 — Upload sample data and load into partitioned Hive table
+# =============================================================================
+- name: Load data into partitioned Hive table
+  hosts: nn
+  become: yes
+  become_user: "{{ hadoop_user }}"
+  vars_files:
+    - vars/secrets.yml
+  tags: [load_data]
+  tasks:
+    - name: Create local data directory
+      ansible.builtin.file:
+        path: "{{ hadoop_user_home }}/hive_data"
+        state: directory
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0755'
+
+    - name: Upload sample data files
+      ansible.builtin.copy:
+        src: "files/{{ item }}"
+        dest: "{{ hadoop_user_home }}/hive_data/{{ item }}"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+      loop:
+        - data_2023.csv
+        - data_2024.csv
+
+    - name: Upload HQL script
+      ansible.builtin.copy:
+        src: files/load_data.hql
+        dest: "{{ hadoop_user_home }}/hive_data/load_data.hql"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+
+    - name: Execute HQL — create partitioned table and load data
+      ansible.builtin.shell: |
+        source {{ hadoop_user_home }}/.bash_profile
+        beeline -u "jdbc:hive2://localhost:10000" -n {{ hadoop_user }} \
+          -f {{ hadoop_user_home }}/hive_data/load_data.hql
+      args:
+        executable: /bin/bash
+      register: _load_result
+
+    - name: Show load data output
+      ansible.builtin.debug:
+        var: _load_result.stdout_lines

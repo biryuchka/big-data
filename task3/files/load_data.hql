@@ -1,0 +1,20 @@
+CREATE DATABASE IF NOT EXISTS demo;
+USE demo;
+
+CREATE TABLE IF NOT EXISTS sales (
+    id      INT,
+    product STRING,
+    amount  DOUBLE
+)
+PARTITIONED BY (year INT)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+LOAD DATA LOCAL INPATH '/home/hadoop/hive_data/data_2023.csv'
+    OVERWRITE INTO TABLE sales PARTITION (year=2023);
+
+LOAD DATA LOCAL INPATH '/home/hadoop/hive_data/data_2024.csv'
+    OVERWRITE INTO TABLE sales PARTITION (year=2024);
+
+SHOW PARTITIONS sales;

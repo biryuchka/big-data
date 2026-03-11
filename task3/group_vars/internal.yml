@@ -1,0 +1,8 @@
+---
+# ProxyCommand
+ansible_ssh_pass: "{{ ubuntu_pass }}"
+ansible_ssh_common_args: >-
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o ProxyCommand='ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -i ~/.ssh/id_big_data_course -W %h:%p ubuntu@178.236.25.98'
